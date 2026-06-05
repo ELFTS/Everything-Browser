@@ -7,18 +7,43 @@
 #include "base/check_op.h"
 #include "base/compiler_specific.h"
 
+namespace {
+void VerifyBytesPerSample(int bytes_per_sample) {
+  CHECK(bytes_per_sample == 1 || bytes_per_sample == 2 ||
+        bytes_per_sample == 4);
+}
+
+base::AlignedHeapArray<uint8_t> MakeBackingData(size_t length,
+                                                int bytes_per_sample) {
+  if (!length) [[unlikely]] {
+    return base::AlignedHeapArray<uint8_t>();
+  }
+  return base::AlignedUninit<uint8_t>(length, bytes_per_sample);
+}
+}  // namespace
+
 AudioChunk::AudioChunk(int bytes_per_sample)
     : bytes_per_sample_(bytes_per_sample) {}
 
 AudioChunk::AudioChunk(size_t length, int bytes_per_sample)
-    : data_string_(length, '\0'), bytes_per_sample_(bytes_per_sample) {
-  DCHECK_EQ(length % bytes_per_sample, 0U);
+    : data_(MakeBackingData(length, bytes_per_sample)),
+      bytes_per_sample_(bytes_per_sample) {
+  VerifyBytesPerSample(bytes_per_sample);
+  CHECK_EQ(length % bytes_per_sample, 0U);
+  std::ranges::fill(data_, 0);
 }
 
 AudioChunk::AudioChunk(const uint8_t* data, size_t length, int bytes_per_sample)
-    : data_string_(reinterpret_cast<const char*>(data), length),
+    : data_(MakeBackingData(length, bytes_per_sample)),
       bytes_per_sample_(bytes_per_sample) {
   DCHECK_EQ(length % bytes_per_sample, 0U);
+}
+
+AudioChunk::AudioChunk(base::span<const uint8_t> data_span,
+                       int bytes_per_sample)
+    : data_(MakeBackingData(data_span.size(), bytes_per_sample)),
+      bytes_per_sample_(bytes_per_sample) {
+  DCHECK_EQ(data_span.size() % bytes_per_sample, 0U);
 }
 
 AudioChunk::~AudioChunk() = default;
@@ -36,13 +61,32 @@ const std::string& AudioChunk::AsString() const {
 }
 
 int16_t AudioChunk::GetSample16(size_t index) const {
-  DCHECK(index < (data_string_.size() / sizeof(int16_t)));
-  return UNSAFE_TODO(SamplesData16()[index]);
+  DCHECK_EQ(static_cast<size_t>(bytes_per_sample_), sizeof(int16_t));
+  return SamplesData16AsSpan()[index];
 }
 
-const int16_t* AudioChunk::SamplesData16() const {
-  return UNSAFE_TODO(reinterpret_cast<const int16_t*>(data_string_.data()));
+base::span<const int16_t> AudioChunk::SamplesData16AsSpan() const {
+  // SAFETY: SamplesData16 returns a pointer to data_ data.
+  // The only concern would be if the length is not multiple of sizeof(int16_t),
+  // which we CHECK below.
+  CHECK_EQ(data_string_.size() % sizeof(int16_t), 0u);
+  return UNSAFE_BUFFERS(base::span<const int16_t>(
+      reinterpret_cast<const int16_t*>(data_string_.data()),
+      data_string_.size() / sizeof(int16_t)));
 }
+
+base::span<int16_t> AudioChunk::SamplesData16AsWriteableSpan() {
+  // SAFETY: `SamplesData16AsSpan()` returns a pointer to `data_`. Make sure
+  // this is safe by ensuring the byte size is a multiple of sizeof(int16_t) and
+  // the data is properly aligned (which the constructor should already
+  // guarantee).
+  CHECK_EQ(static_cast<size_t>(bytes_per_sample_), sizeof(int16_t));
+  CHECK(base::IsAligned(data_.data(), alignof(int16_t)));
+  return UNSAFE_BUFFERS(
+      base::span<int16_t>(reinterpret_cast<int16_t*>(data_.data()),
+                          data_.size() / sizeof(int16_t)));
+}
+
 
 AudioBuffer::AudioBuffer(int bytes_per_sample)
     : bytes_per_sample_(bytes_per_sample) {
